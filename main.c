@@ -16,6 +16,7 @@
 #include "kernel/task.h"
 #include "emu/cpu.h"
 #include "emu/tlb.h"
+#include "fs/real.h"    // realfs: mount host /sys on Linux hosts
 #include "xX_main_Xx.h"
 
 // Thread-local JIT recovery state (defined in asbestos.c)
@@ -515,5 +516,13 @@ int main(int argc, char *const argv[]) {
     }
     do_mount(&procfs, "proc", "/proc", "", 0);
     do_mount(&devptsfs, "devpts", "/dev/pts", "", 0);
+#ifdef __linux__
+    // On Linux hosts the guest shares the host kernel, so expose the host's real
+    // /sys into the guest. Tools like lscpu and fastfetch read the CPU topology
+    // from /sys/devices/system/cpu/possible (and friends), which an empty /sys
+    // makes unavailable. The macOS app keeps its existing empty /sys.
+    if (do_mount(&realfs, "/sys", "/sys", "", 0) < 0)
+        fprintf(stderr, "warning: could not mount host /sys\n");
+#endif
     task_run_current();
 }

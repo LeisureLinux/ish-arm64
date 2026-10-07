@@ -36,3 +36,6 @@ alpine-arm64-clean/
 alpine-arm64.tar.gz
 fakefsify
 cross-*.txt
+
+# local release staging (uploaded to GitHub Releases)
+release/

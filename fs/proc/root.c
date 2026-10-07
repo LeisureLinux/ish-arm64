@@ -28,6 +28,22 @@ static int proc_show_stat(struct proc_entry *UNUSED(entry), struct proc_data *bu
 static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     unsigned cpus = sysconf(_SC_NPROCESSORS_ONLN);
     { const char *e = getenv("ISH_FAKE_NCPU"); if (e) { int n = atoi(e); if (n > 0) cpus = n; } }
+    // Try to surface a human-readable board/model name (fastfetch & friends read
+    // the ARM "Hardware:" line). Prefer the host device-tree model, then the
+    // uname machine, falling back to a generic label.
+    char model[128];
+    model[0] = '\0';
+    FILE *dt = fopen("/proc/device-tree/model", "r");
+    if (dt != NULL) {
+        size_t n = fread(model, 1, sizeof(model) - 1, dt);
+        if (n > 0) { while (n > 0 && (model[n-1] == '\0' || model[n-1] == '\n')) n--; model[n] = '\0'; }
+        fclose(dt);
+    }
+    if (model[0] == '\0') {
+        struct uname u;
+        do_uname(&u);
+        snprintf(model, sizeof(model), "%s", u.arch);
+    }
     for (unsigned i = 0; i < cpus; i++) {
         proc_printf(buf, "processor\t: %u\n", i);
 #ifdef GUEST_ARM64
@@ -35,6 +51,8 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
         proc_printf(buf, "BogoMIPS\t: 48.00\n");
         // Include crypto features that iSH ARM64 emulates
         proc_printf(buf, "Features\t: fp asimd evtstrm aes pmull atomics\n");
+        if (model[0] != '\0')
+            proc_printf(buf, "Hardware\t: %s\n", model);
         proc_printf(buf, "CPU implementer\t: 0x00\n");
         proc_printf(buf, "CPU architecture: 8\n");
         proc_printf(buf, "CPU variant\t: 0x0\n");
