@@ -786,12 +786,12 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         fake_stat->gid = 0;
         fake_stat->size = host_stat.st_size;
         fake_stat->blocks = host_stat.st_blocks;
-        fake_stat->mtime = host_stat.st_mtimespec.tv_sec;
-        fake_stat->mtime_nsec = host_stat.st_mtimespec.tv_nsec;
-        fake_stat->atime = host_stat.st_atimespec.tv_sec;
-        fake_stat->atime_nsec = host_stat.st_atimespec.tv_nsec;
-        fake_stat->ctime = host_stat.st_ctimespec.tv_sec;
-        fake_stat->ctime_nsec = host_stat.st_ctimespec.tv_nsec;
+        fake_stat->mtime = host_stat.st_mtim.tv_sec;
+        fake_stat->mtime_nsec = host_stat.st_mtim.tv_nsec;
+        fake_stat->atime = host_stat.st_atim.tv_sec;
+        fake_stat->atime_nsec = host_stat.st_atim.tv_nsec;
+        fake_stat->ctime = host_stat.st_ctim.tv_sec;
+        fake_stat->ctime_nsec = host_stat.st_ctim.tv_nsec;
         ISH_SIGNPOST_SCOPE_END(fs, "fakefs_stat", _fs_spid);
         return 0;
     }
@@ -833,9 +833,9 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         /* Copy basic fields from real stat */
         fake_stat->size = real_stat.st_size;
         fake_stat->nlink = real_stat.st_nlink;
-        fake_stat->atime = real_stat.st_atimespec.tv_sec;
-        fake_stat->mtime = real_stat.st_mtimespec.tv_sec;
-        fake_stat->ctime = real_stat.st_ctimespec.tv_sec;
+        fake_stat->atime = real_stat.st_atim.tv_sec;
+        fake_stat->mtime = real_stat.st_mtim.tv_sec;
+        fake_stat->ctime = real_stat.st_ctim.tv_sec;
         err = 0;
     } else {
         err = realfs.stat(mount, path, fake_stat);
@@ -1149,9 +1149,14 @@ static void __attribute__((constructor)) init_fake_fdops() {
 static int create_relative_symlink(int root_fd, const char *host_link,
                                     const char *host_path) {
     /* Get the absolute path of root_fd (F_GETPATH resolves symlinks,
-     * e.g. /var -> /private/var on iOS) */
+     * e.g. /var -> /private/var on iOS). No Linux equivalent needed for
+     * correctness; skip and fall back to absolute symlink. */
     char root_abs[PATH_MAX];
+#if defined(__APPLE__)
     if (fcntl(root_fd, F_GETPATH, root_abs) != 0) {
+#else
+    if (1) {
+#endif
         fprintf(stderr, "create_relative_symlink: F_GETPATH failed\n");
         /* Fall back to absolute symlink */
         return symlinkat(host_path, root_fd, host_link);
@@ -1226,6 +1231,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
 
     /* Log root_fd info for context */
     {
+#if defined(__APPLE__)
         char fd_path[PATH_MAX];
         if (fcntl(g_fakefs_mount->root_fd, F_GETPATH, fd_path) == 0) {
             fprintf(stderr, "fakefs_bind_mount: root_fd=%d path=\"%s\"\n",
@@ -1234,6 +1240,9 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
             fprintf(stderr, "fakefs_bind_mount: root_fd=%d (F_GETPATH failed)\n",
                     g_fakefs_mount->root_fd);
         }
+#else
+        (void)0;
+#endif
     }
 
     /* Verify host path exists (directory or regular file) */

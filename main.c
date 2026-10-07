@@ -6,9 +6,11 @@
 #include "util/signpost.h"
 #include <termios.h>
 #include <unistd.h>
-#include <mach/mach.h>
 #include <pthread.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
 #include <sys/sysctl.h>   // [T-ish-cli-memory-governor] hw.memsize
+#endif
 #include "kernel/calls.h"
 #include "kernel/mm.h"    // [T-ish-cli-memory-governor] ish_set_memory_status
 #include "kernel/task.h"
@@ -71,13 +73,18 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         ucontext_t *uc = (ucontext_t *)ctx;
 
         // _cpu is in x1 — pointer to cpu_state within fiber_frame
-        uint64_t cpu_ptr = uc->uc_mcontext->__ss.__x[1];
+        uint64_t cpu_ptr = uc->uc_mcontext.regs[1];
 
         // Reconstruct guest segfault_addr from registers.
         // x7 = _addr (host pointer = data_minus_addr + guest_addr)
         // x10 may hold data_minus_addr from TLB lookup (but only on TLB HIT path)
+#if defined(__APPLE__)
         uint64_t x7 = uc->uc_mcontext->__ss.__x[7];
         uint64_t x10 = uc->uc_mcontext->__ss.__x[10];
+#else
+        uint64_t x7 = uc->uc_mcontext.regs[7];
+        uint64_t x10 = uc->uc_mcontext.regs[10];
+#endif
         uint64_t guest_addr = (x7 - x10) & 0xffffffffffffULL;
 
         // Store diagnostic info for handle_interrupt to read
@@ -86,15 +93,18 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         jit_last_x10 = x10;
         jit_crash_count++;
 
-        // Determine read/write from host ESR. Bit 6 (WnR): 0=read, 1=write.
+        // Determine read/write. On Apple the host ESR bit 6 (WnR) is used.
+        // glibc does not expose the ESR, so approximate with si_code:
+        // SEGV_ACCERR is the CoW/TLB-stale permission fault iSH recovers from.
+        int was_write;
+#if defined(__APPLE__)
         uint64_t esr = uc->uc_mcontext->__es.__esr;
-        int was_write = (esr & 0x40) != 0;
+        was_write = (esr & 0x40) != 0;
+#else
+        was_write = (info->si_code == SEGV_ACCERR);
+#endif
 
         // Write crash info directly to cpu_state via _cpu pointer.
-        // Each store must match the field's real width: segfault_was_write is a
-        // `bool`, and the previous `*(int *)` store wrote 4 bytes over it and the
-        // padding before `trapno`. The generated gadgets use `strb` for the same
-        // field, so 1 byte is the correct width on both sides.
         *(addr_t *)(cpu_ptr + CRASH_CPU_segfault_addr) = guest_addr;
         *(bool *)(cpu_ptr + CRASH_CPU_segfault_was_write) = (bool)was_write;
         // Restore guest PC to block start for re-execution
@@ -103,10 +113,14 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         // Restore SP to the value saved by fiber_enter, so fiber_exit
         // can correctly pop the callee-saved register frame.
         uint64_t exit_sp = *(uint64_t *)(cpu_ptr + CRASH_LOCAL_jit_exit_sp);
+#if defined(__APPLE__)
         uc->uc_mcontext->__ss.__sp = exit_sp;
-
         // Redirect execution to crash trampoline (returns INT_JIT_CRASH)
         uc->uc_mcontext->__ss.__pc = (uint64_t)jit_crash_trampoline;
+#else
+        uc->uc_mcontext.sp = exit_sp;
+        uc->uc_mcontext.pc = (uint64_t)jit_crash_trampoline;
+#endif
 
         // Unblock signal so it can fire again on next crash
         sigset_t unblock;
@@ -127,14 +141,16 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     write(STDERR_FILENO, buf, len);
 #ifdef __aarch64__
     len = snprintf(buf, sizeof(buf),
-        "pc:  0x%llx\nlr:  0x%llx\nsp:  0x%llx\n"
+        "pc:  0x%llx\nsp:  0x%llx\n"
         "x0:  0x%llx\nx1:  0x%llx\nx2:  0x%llx\n"
         "x7:  0x%llx\nx28: 0x%llx\n",
-        uc->uc_mcontext->__ss.__pc, uc->uc_mcontext->__ss.__lr,
-        uc->uc_mcontext->__ss.__sp,
-        uc->uc_mcontext->__ss.__x[0], uc->uc_mcontext->__ss.__x[1],
-        uc->uc_mcontext->__ss.__x[2],
-        uc->uc_mcontext->__ss.__x[7], uc->uc_mcontext->__ss.__x[28]);
+        (unsigned long long)uc->uc_mcontext.pc,
+        (unsigned long long)uc->uc_mcontext.sp,
+        (unsigned long long)uc->uc_mcontext.regs[0],
+        (unsigned long long)uc->uc_mcontext.regs[1],
+        (unsigned long long)uc->uc_mcontext.regs[2],
+        (unsigned long long)uc->uc_mcontext.regs[7],
+        (unsigned long long)uc->uc_mcontext.regs[28]);
     write(STDERR_FILENO, buf, len);
 #endif
     void *bt[20];
@@ -325,21 +341,31 @@ void *poll_fn(void *arg) {
 //     otherwise need it, so this is a plain detached pthread on the same
 //     cadence. The kernel's >2s staleness rule still fails closed if it dies.
 static uint64_t ish_cli_phys_footprint(void) {
+#if defined(__APPLE__)
     task_vm_info_data_t info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
         return 0;
     return (uint64_t) info.phys_footprint;
+#else
+    (void)0; // Linux: no per-process physical footprint feed; governor no-ops
+    return 0;
+#endif
 }
 
 static uint64_t ish_cli_host_ram(void) {
     // hw.memsize is the machine's physical RAM; on a CLI host that is the only
     // honest ceiling available (no per-process allowance exists).
+#if defined(__APPLE__)
     uint64_t bytes = 0;
     size_t len = sizeof(bytes);
     if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) != 0)
         return 0;
     return bytes;
+#else
+    (void)0; // Linux: leave RAM unknown so the governor safely no-ops
+    return 0;
+#endif
 }
 
 static void ish_cli_memory_governor_tick(void) {
