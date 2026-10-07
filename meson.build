@@ -1777,9 +1777,8 @@ if get_option('kernel') == 'ish'
         dependencies: dependencies,
         include_directories: includes)
 
-    if not meson.is_cross_build()
-        executable('ish', ['main.c'], dependencies: ish)
-    endif
+    # Cross-build (e.g. aarch64 host) also needs the final ish executable.
+    executable('ish', ['main.c'], dependencies: ish)
 
 elif get_option('kernel') == 'linux'
     kernel_src = [

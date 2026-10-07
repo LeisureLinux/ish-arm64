@@ -24,3 +24,15 @@ bench/
 tools/prebuilt_gadget_gen/__pycache__/
 tools/prebuilt_gadget_gen/*.bak
 .cache/
+
+# ---- Local build artifacts (regenerable via build-and-deploy.sh) ----
+# These are produced during the aarch64 cross-build / Alpine rootfs packing.
+# The repo ships SOURCE + scripts; rebuild with ./build-and-deploy.sh.
+build-arm64/
+build-native/
+arm64-prefix/
+alpine-arm64/
+alpine-arm64-clean/
+alpine-arm64.tar.gz
+fakefsify
+cross-*.txt

@@ -1,5 +1,8 @@
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/tcp.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -44,8 +47,6 @@ const struct fd_ops socket_fdops;
 #define AF_NETLINK_ 16
 #define NETLINK_ROUTE_ 0
 
-// nlmsghdr, as the guest (Linux/arm64) sees it. Same layout on all Linux
-// arches: 16 bytes, 4-byte aligned.
 struct nlmsghdr_ {
     uint32_t nlmsg_len;
     uint16_t nlmsg_type;
@@ -57,6 +58,14 @@ struct nlmsghdr_ {
 #define NLMSG_ERROR_ 2
 #define NLMSG_DONE_  3
 #define NLMSG_ALIGN_(len) (((len) + 3) & ~3u)
+#define NLM_F_MULTI_  0x2   // kernel marks every multiplexed dump message
+#define NLM_F_DUMP_   0x300 // NLM_F_ROOT|NLM_F_MATCH (request side)
+
+// rtattr (netlink attribute) header: 4 bytes, 4-byte aligned payload.
+struct rtattr_ {
+    uint16_t rta_len;
+    uint16_t rta_type;
+};
 
 // sockaddr_nl as the guest sees it (12 bytes on all Linux arches).
 struct sockaddr_nl_ {
@@ -70,7 +79,10 @@ bool ish_netlink_stub_enabled(void) {
     static int cached = -1;
     if (cached == -1) {
         const char *v = getenv("ISH_NETLINK_STUB");
-        cached = (v != NULL && v[0] == '1') ? 1 : 0;
+        // Default ON: the guest has no real netlink socket, so interface
+        // enumeration (ip/ifconfig) is synthesized from the host. Opt out with
+        // ISH_NETLINK_STUB=0.
+        cached = (v == NULL || v[0] != '0') ? 1 : 0;
     }
     return cached == 1;
 }
@@ -79,38 +91,253 @@ bool ish_netlink_stub_enabled(void) {
 // fd->real_fd is the guest-facing end, netlink_peer_fd the end this stub
 // writes replies into. That buys working poll/epoll/read/close/refcounting
 // from the existing socket_fdops machinery for free -- only sendto/recvfrom
-// semantics are special-cased.
+
+// --- netlink route message types & rtattr families (Linux/arm64 values) ---
+#define RTM_GETLINK_   18
+#define RTM_GETADDR_   22
+#define RTM_GETROUTE_  26
+// A netlink dump REPLY uses the "new" message types, not the "get" types:
+// the kernel answers RTM_GETLINK with a stream of RTM_NEWLINK messages.
+#define RTM_NEWLINK_   16
+#define RTM_NEWADDR_   20
+#define IFLA_ADDRESS_  1
+#define IFLA_IFNAME_   3
+#define IFLA_MTU_      4
+#define IFLA_OPERSTATE_ 7
+#define IFLA_QDISC_    8
+#define IFA_ADDRESS_   1
+#define IFA_LOCAL_     2
+#define IFA_LABEL_     3
+#define IFA_BROADCAST_ 4
+#define IFA_FLAGS_     8
+
+// Cap on how many synthesized bytes we deliver per recv (dump + DONE).
+static const size_t netlink_reply_cap_ = 32 * 1024;
+
+// Build a real netlink link/addr dump from the host's getifaddrs() so that
+// guest tools like `ip addr`/`ip link`/`ifconfig` see a populated interface
+// list. On the host (and on iOS where iSH's host process is the app) the
+// guest sockets share the host network, so mirroring getifaddrs() is the
+// faithful representation of the guest's virtual IP identity.
+//
+// Two message shapes are emitted:
+//   RTM_GETLINK  -> ifinfomsg { ifindex, type, flags } + rtattrs (name/addr/mtu)
+//   RTM_GETADDR  -> ifaddrmsg { ifindex, family, prefixlen } + rtattrs (addr/label)
+// Each multi-message dump ends with a bare NLMSG_DONE.
+struct nlmsg_buf_ {
+    char data[16384];
+    size_t len;
+};
+
+static void put_rtattr_(struct nlmsg_buf_ *b, uint16_t type, const void *val,
+                        uint16_t vlen) {
+    struct rtattr_ *rta;
+    size_t total = NLMSG_ALIGN_(vlen) + sizeof(*rta);
+    if (b->len + total > sizeof(b->data))
+        return;
+    rta = (struct rtattr_ *) (b->data + b->len);
+    rta->rta_len = (uint16_t) (vlen + sizeof(*rta));  // RTA_LENGTH(): unaligned
+    rta->rta_type = type;
+    if (vlen)
+        memcpy(rta + 1, val, vlen);
+    b->len += total;
+}
+
+static void open_nlmsg_(struct nlmsg_buf_ *b, uint16_t type, uint32_t seq,
+                        uint32_t pid, size_t *hdr_off) {
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *) (b->data + b->len);
+    *hdr_off = b->len;
+    h->nlmsg_len = 0; // filled at close
+    h->nlmsg_type = type;
+    // Every message in a dump carries NLM_F_MULTI so strict clients
+    // (iproute2's rtnl_dump_filter) keep reading until NLMSG_DONE.
+    h->nlmsg_flags = NLM_F_MULTI_;
+    h->nlmsg_seq = seq;
+    h->nlmsg_pid = pid;
+    b->len += sizeof(*h);
+}
+
+static void close_nlmsg_(struct nlmsg_buf_ *b, size_t hdr_off) {
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *) (b->data + hdr_off);
+    h->nlmsg_len = (uint32_t) (b->len - hdr_off);
+}
+
+// Synthesize a deterministic guest MAC for an interface (the guest has no
+// real link address, so we derive a stable locally-administered address from
+// the interface name). Writes 6 bytes into @mac.
+static void ish_synth_mac_(const char *name, unsigned char mac[6]) {
+    uint32_t x = 2166136261u;
+    for (const char *p = name; *p; p++) {
+        x ^= (unsigned char) *p;
+        x *= 16777619u;
+    }
+    mac[0] = 0x02; // locally administered, unicast
+    mac[1] = (x >> 24) & 0xff; mac[2] = (x >> 16) & 0xff;
+    mac[3] = (x >> 8) & 0xff;  mac[4] = x & 0xff;
+    mac[5] = mac[1] ^ mac[4];
+}
+
+// Synthesize the full link/addr dump for a given RTM request type.
+//
+// getifaddrs() returns one entry per (interface, address-family) pair, so we
+// dedupe by interface name: one RTM_NEWLINK per unique interface, and one
+// RTM_NEWADDR per actual IP address. The guest's virtual identity is mirrored
+// from the host's getifaddrs() (on iOS the host process is the app, whose
+// network the guest shares).
+static void ish_netlink_build_dump_(uint16_t rtm_type, uint32_t seq, uint32_t pid,
+                                     struct nlmsg_buf_ *out) {
+    out->len = 0;
+    struct ifaddrs *ifas = NULL;
+    if (getifaddrs(&ifas) != 0)
+        ifas = NULL;
+
+    // First pass: unique interface names, in first-seen order.
+    char names[64][IFNAMSIZ];
+    unsigned nnames = 0;
+    for (struct ifaddrs *ifa = ifas; ifa && nnames < 64; ifa = ifa->ifa_next) {
+        if (ifa->ifa_name == NULL)
+            continue;
+        bool seen = false;
+        for (unsigned i = 0; i < nnames; i++)
+            if (strcmp(names[i], ifa->ifa_name) == 0) { seen = true; break; }
+        if (!seen)
+            strncpy(names[nnames++], ifa->ifa_name, IFNAMSIZ - 1)[IFNAMSIZ - 1] = 0;
+    }
+
+    // Only RTM_GETLINK / RTM_GETADDR produce a populated dump. Other request
+    // types (RTM_GETROUTE, NETLINK_SOCK_DIAG queries used by `ip route` and
+    // `ss`, etc.) have no useful data in this synthetic model, so we emit an
+    // empty NLMSG_DONE terminator and let the client treat them as "no data"
+    // instead of crashing on unsynthesized bytes.
+    if (rtm_type == RTM_GETLINK_ || rtm_type == RTM_GETADDR_) {
+    unsigned idx = 1;
+    for (unsigned n = 0; n < nnames; n++, idx++) {
+        const char *iname = names[n];
+        struct ifaddrs *rep = NULL;
+        for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next)
+            if (ifa->ifa_name && strcmp(ifa->ifa_name, iname) == 0) { rep = ifa; break; }
+        unsigned flags = rep ? rep->ifa_flags : 0;
+
+        if (rtm_type == RTM_GETLINK_) {
+            size_t hdr;
+            open_nlmsg_(out, RTM_NEWLINK_, seq, pid, &hdr);
+            struct ifinfomsg_ {
+                uint8_t  ifi_family;
+                uint8_t  __ifi_pad;
+                uint16_t ifi_type;
+                int32_t  ifi_index;
+                uint32_t ifi_flags;
+                uint32_t ifi_change;
+            } *ii = (struct ifinfomsg_ *) (out->data + out->len);
+            out->len += sizeof(*ii);
+            memset(ii, 0, sizeof(*ii));
+            ii->ifi_family = 0; // AF_UNSPEC for links
+            ii->ifi_type = (strncmp(iname, "lo", 2) == 0) ? 772 /*ARPHRD_LOOPBACK*/ : 1 /*ARPHRD_ETHER*/;
+            ii->ifi_index = (int32_t) idx;
+            ii->ifi_flags = flags;
+            unsigned char mac[6];
+            ish_synth_mac_(iname, mac);
+            put_rtattr_(out, IFLA_ADDRESS_, mac, 6);
+            put_rtattr_(out, IFLA_IFNAME_, iname, (uint16_t) (strlen(iname) + 1));
+            put_rtattr_(out, IFLA_MTU_, &(uint32_t){1500}, sizeof(uint32_t));
+            uint8_t operstate = (flags & 1 /*IFF_UP*/) ? 6 /*IF_OPER_UP*/ : 2 /*IF_OPER_DOWN*/;
+            put_rtattr_(out, IFLA_OPERSTATE_, &operstate, sizeof(operstate));
+            put_rtattr_(out, IFLA_QDISC_, "noqueue", (uint16_t) (strlen("noqueue") + 1));
+            close_nlmsg_(out, hdr);
+        } else { // RTM_GETADDR_
+            for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
+                if (ifa->ifa_name == NULL || strcmp(ifa->ifa_name, iname) != 0)
+                    continue;
+                if (ifa->ifa_addr == NULL)
+                    continue;
+                int family = ifa->ifa_addr->sa_family;
+                if (family != AF_INET_ && family != AF_INET6_)
+                    continue;
+                const void *aptr; socklen_t alen;
+                if (family == AF_INET_) {
+                    aptr = &((const struct sockaddr_in *) ifa->ifa_addr)->sin_addr;
+                    alen = 4;
+                } else {
+                    aptr = &((const struct sockaddr_in6 *) ifa->ifa_addr)->sin6_addr;
+                    alen = 16;
+                }
+                size_t hdr;
+                open_nlmsg_(out, RTM_NEWADDR_, seq, pid, &hdr);
+                struct ifaddrmsg_ {
+                    uint8_t  ifa_family;
+                    uint8_t  ifa_prefixlen;
+                    uint8_t  ifa_flags;
+                    uint8_t  ifa_scope;
+                    uint32_t ifa_index;
+                } *ia = (struct ifaddrmsg_ *) (out->data + out->len);
+                out->len += sizeof(*ia);
+                memset(ia, 0, sizeof(*ia));
+                ia->ifa_family = (uint8_t) family;
+                ia->ifa_prefixlen = (family == AF_INET_) ? 24 : 64;
+                ia->ifa_index = idx;
+                put_rtattr_(out, IFA_ADDRESS_, aptr, (uint16_t) alen);
+                put_rtattr_(out, IFA_LOCAL_, aptr, (uint16_t) alen);
+                put_rtattr_(out, IFA_LABEL_, iname, (uint16_t) (strlen(iname) + 1));
+                close_nlmsg_(out, hdr);
+            }
+        }
+    }
+    }
+    if (ifas)
+        freeifaddrs(ifas);
+    // terminator: NLMSG_DONE carries a 4-byte (int) error code payload, so the
+    // message length must be NLMSG_LENGTH(sizeof(int)) = 20, not just the 16
+    // byte header. iproute2's rtnl_dump_done() rejects a shorter DONE as
+    // "DONE truncated".
+    uint32_t done_err = 0;
+    struct nlmsghdr_ done;
+    memset(&done, 0, sizeof(done));
+    done.nlmsg_len = (uint32_t) (sizeof(done) + sizeof(done_err));
+    done.nlmsg_type = NLMSG_DONE_;
+    done.nlmsg_flags = 0;
+    done.nlmsg_seq = seq;
+    done.nlmsg_pid = pid;
+    if (out->len + sizeof(done) + sizeof(done_err) <= sizeof(out->data)) {
+        memcpy(out->data + out->len, &done, sizeof(done));
+        out->len += sizeof(done);
+        memcpy(out->data + out->len, &done_err, sizeof(done_err));
+        out->len += sizeof(done_err);
+    }
+}
+
+// nlmsghdr, as the guest (Linux/arm64) sees it. Same layout on all Linux
+// arches: 16 bytes, 4-byte aligned.
+
+
 static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
-    // Answer every well-formed request with an empty dump: one NLMSG_DONE
-    // echoing the request's seq and pid. A malformed/short request gets the
-    // same treatment (seq=0) rather than an error -- keeps the probe simple.
     uint32_t seq = 0, pid = 0;
+    uint16_t rtm = 0;
     if (req != NULL && req_len >= sizeof(struct nlmsghdr_)) {
         const struct nlmsghdr_ *h = req;
         seq = h->nlmsg_seq;
         pid = h->nlmsg_pid;
+        rtm = h->nlmsg_type;
     }
-    struct nlmsghdr_ done = {
-        .nlmsg_len = NLMSG_ALIGN_(sizeof(struct nlmsghdr_)),
-        .nlmsg_type = NLMSG_DONE_,
-        .nlmsg_flags = 0,
-        .nlmsg_seq = seq,
-        .nlmsg_pid = pid,
-    };
     int peer = fd->socket.netlink_peer_fd;
     if (peer < 0)
         return _EINVAL;
-    if (write(peer, &done, sizeof(done)) < 0)
-        return errno_map();
-    {   // [STAGE-0 PROBE] log the request's RTM type so we can see exactly
-        // which netlink queries the guest actually issues.
-        uint16_t rtm = 0;
-        if (req != NULL && req_len >= sizeof(struct nlmsghdr_))
-            rtm = ((const struct nlmsghdr_ *) req)->nlmsg_type;
-        const char *name = rtm == 18 ? "RTM_GETLINK" : rtm == 22 ? "RTM_GETADDR" :
-                           rtm == 26 ? "RTM_GETROUTE" : "other";
-        TRACE("NETLINK_STUB reply NLMSG_DONE seq=%u pid=%u req_type=%u(%s) (empty dump)\n",
-               seq, pid, rtm, name);
+    // RTM_GETLINK / RTM_GETADDR / RTM_GETROUTE: synthesize a real dump from
+    // the host's getifaddrs() so `ip addr`/`ip link`/`ifconfig` work. The
+    // synthesized bytes are buffered on the fd and drained by recvmsg/recvfrom.
+    struct nlmsg_buf_ buf;
+    ish_netlink_build_dump_(rtm, seq, pid, &buf);
+    TRACE("NETLINK synthesize rtm=%u seq=%u pid=%u bytes=%zu\n", rtm, seq, pid, buf.len);
+    // replace any pending reply buffer
+    free(fd->socket.netlink_reply);
+    fd->socket.netlink_reply = NULL;
+    fd->socket.netlink_reply_len = 0;
+    fd->socket.netlink_reply_off = 0;
+    if (buf.len > 0) {
+        fd->socket.netlink_reply = malloc(buf.len);
+        if (fd->socket.netlink_reply) {
+            memcpy(fd->socket.netlink_reply, buf.data, buf.len);
+            fd->socket.netlink_reply_len = buf.len;
+        }
     }
     return (int) req_len;
 }
@@ -157,26 +384,65 @@ static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr) {
     iov_addr = m.msg_iov; iovlen = m.msg_iovlen;
     name_addr = m.msg_name; namelen = m.msg_namelen;
 #endif
-    char buf[4096];
-    ssize_t n = read(sock->real_fd, buf, sizeof(buf));
-    if (n < 0) return errno_map();
+    // drain the synthesized reply buffer (empty if none queued)
+    char *src = sock->socket.netlink_reply + sock->socket.netlink_reply_off;
+    size_t avail = sock->socket.netlink_reply_len - sock->socket.netlink_reply_off;
+    size_t send = avail < netlink_reply_cap_ ? avail : netlink_reply_cap_;
 
+    // iproute2's rtnl_recvmsg() queries the datagram length first with a
+    // zero-length iovec (recvmsg(..., MSG_PEEK|MSG_TRUNC)), then issues a
+    // second recvmsg with a real buffer. On the zero-iovec probe we report the
+    // available length WITHOUT consuming it, so the following real recvmsg
+    // still sees the full synthesized dump.
+    if (iovlen == 1) {
+        struct iovec64_ iv;
+        if (user_get(iov_addr, iv)) return _EFAULT;
+        if (iv.base == 0 && iv.len == 0) {
+            TRACE("NETLINK_STUB probe recvmsg -> %zu bytes (unconsumed)\n", send);
+            if (name_addr != 0 && namelen >= sizeof(struct sockaddr_nl_)) {
+                struct sockaddr_nl_ nl = { .nl_family = AF_NETLINK_, .nl_pad = 0,
+                                           .nl_pid = 0, .nl_groups = 0 };
+                if (user_write(name_addr, &nl, sizeof(nl))) return _EFAULT;
+            }
+            return (int) send;
+        }
+    }
+
+    // Normal path: copy into the guest's iovec buffer(s) and consume.
     size_t off = 0;
-    for (uint64_t i = 0; i < iovlen && off < (size_t) n; i++) {
+    for (uint64_t i = 0; i < iovlen && off < send; i++) {
         struct iovec64_ iv;
         if (user_get(iov_addr + i * sizeof(iv), iv)) return _EFAULT;
-        size_t want = (size_t) iv.len, have = (size_t) n - off;
+        if (iv.len == 0) continue;
+        size_t want = (size_t) iv.len, have = send - off;
         if (want > have) want = have;
-        if (want && user_write((addr_t) iv.base, buf + off, want)) return _EFAULT;
+        if (want && user_write((addr_t) iv.base, src + off, want)) return _EFAULT;
         off += want;
     }
+    sock->socket.netlink_reply_off += off;
     if (name_addr != 0 && namelen >= sizeof(struct sockaddr_nl_)) {
         struct sockaddr_nl_ nl = { .nl_family = AF_NETLINK_, .nl_pad = 0,
                                    .nl_pid = 0, .nl_groups = 0 };
         if (user_write(name_addr, &nl, sizeof(nl))) return _EFAULT;
     }
-    TRACE("NETLINK_STUB recvmsg -> %zd bytes\n", n);
+    TRACE("NETLINK_STUB recvmsg -> %zu bytes\n", off);
     return (int) off;
+}
+
+// recvfrom on a netlink stub drains the same synthesized buffer. The generic
+// sys_recvfrom path would otherwise block on the host socketpair.
+static int netlink_stub_recvfrom(struct fd *sock, addr_t buf_addr, size_t len) {
+    char *src = sock->socket.netlink_reply + sock->socket.netlink_reply_off;
+    size_t avail = sock->socket.netlink_reply_len - sock->socket.netlink_reply_off;
+    size_t send = avail < netlink_reply_cap_ ? avail : netlink_reply_cap_;
+    // iproute2 probes with recvfrom(..., 0) to learn the message length; return
+    // the length without consuming (it re-queries with a real buffer).
+    if (len == 0)
+        return (int) send;
+    size_t want = len < send ? len : send;
+    if (want && user_write(buf_addr, src, want)) return _EFAULT;
+    sock->socket.netlink_reply_off += want;
+    return (int) want;
 }
 
 static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
@@ -963,6 +1229,10 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    // [STAGE-0 PROBE] netlink stub: drain the synthesized reply buffer
+    // synchronously (no host socketpair blocking).
+    if (fd_is_netlink_stub(sock))
+        return netlink_stub_recvfrom(sock, buffer_addr, len);
     int real_flags = sock_flags_to_real(flags);
     if (real_flags < 0)
         return _EINVAL;
@@ -1769,6 +2039,21 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
 }
 
 static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
+    // [NETLINK STUB] a write() to a netlink fd carries one or more netlink
+    // request messages (rtnetlink allows raw write()). Synthesize the reply
+    // into the fd's reply buffer instead of forwarding to the host.
+    if (fd_is_netlink_stub(fd)) {
+        size_t off = 0;
+        while (off + sizeof(struct nlmsghdr_) <= size) {
+            const struct nlmsghdr_ *h = (const struct nlmsghdr_ *)((const char *)buf + off);
+            uint32_t nllen = h->nlmsg_len;
+            if (nllen < sizeof(struct nlmsghdr_) || off + nllen > size)
+                break;
+            netlink_stub_reply(fd, h, nllen);
+            off += (nllen + 3) & ~3u;
+        }
+        return (ssize_t) size;
+    }
     int err;
     int eintr_count = 0;
     for (;;) {
@@ -1797,6 +2082,8 @@ static int sock_close(struct fd *fd) {
         close(fd->socket.netlink_peer_fd);
         fd->socket.netlink_peer_fd = -1;
     }
+    free(fd->socket.netlink_reply);
+    fd->socket.netlink_reply = NULL;
     sockrestart_end_listen(fd);
     // FIXME next 3 lines should go in a function like release_unix_names
     inode_release_if_exist(fd->socket.unix_name_inode);

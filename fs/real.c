@@ -12,6 +12,9 @@
 #include <sys/file.h>
 #include <sys/statvfs.h>
 #include <poll.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <ifaddrs.h>
 
 #include "debug.h"
 #include "misc.h"
@@ -659,6 +662,13 @@ ssize_t realfs_ioctl_size(int cmd) {
         return sizeof(struct termios_);
     if (cmd == TIOCGWINSZ_)
         return sizeof(struct winsize_);
+    // SIOC{G}IF* interface ioctls: aarch64 guest and host share an identical
+    // `struct ifreq` layout, so single-ifreq requests forward as-is. SIOCGIFCONF
+    // (0x8912) and SIOCGIFHWADDR (0x8942) are handled specially below.
+    if (cmd == SIOCGIFCONF_)
+        return 16; // aarch64 struct ifconf: 8-byte ptr + 4-byte len + 4 pad
+    if (cmd >= 0x8910 && cmd <= 0x894f)
+        return sizeof(struct ifreq_);
     return -1;
 }
 
@@ -703,6 +713,80 @@ int realfs_ioctl(struct fd *fd, int cmd, void *arg) {
             }
             return _ENOTTY;
         }
+        // SIOCGIFHWADDR: synthesize a stable guest MAC (the guest has no real
+        // link address). Guest passes struct ifreq_ with ifr_name set; we fill
+        // ifr_hwaddr as a sockaddr whose sa_family is the ARPHRD type (1 =
+        // ARPHRD_ETHER) so net-tools prints exactly 6 MAC bytes, with the
+        // 6-byte MAC in sa_data (offset 2).
+        case SIOCGIFHWADDR_: {
+            struct ifreq_ *r = (struct ifreq_ *) arg;
+            unsigned char mac[6];
+            uint32_t x = 2166136261u;
+            for (const char *p = r->name; *p; p++) { x ^= (unsigned char)*p; x *= 16777619u; }
+            mac[0] = 0x02; mac[1] = (x>>24)&0xff; mac[2] = (x>>16)&0xff;
+            mac[3] = (x>>8)&0xff; mac[4] = x&0xff; mac[5] = mac[1]^mac[4];
+            memset(&r->u.hwaddr, 0, sizeof(r->u.hwaddr));
+            r->u.hwaddr.family = 1; // ARPHRD_ETHER
+            memcpy(r->u.hwaddr.data, mac, 6);
+            return 0;
+        }
+        // SIOCGIFCONF: enumerate addresses into a struct ifconf. The guest
+        // passes a struct ifconf { char *ifc_buf; int ifc_len } (aarch64 layout:
+        // 8-byte ptr + 4-byte len). `arg` is the host-mapped copy of that.
+        // We build the ifreq list from getifaddrs() and write it back to the
+        // guest buffer so `ifconfig` lists every interface/IP.
+        case SIOCGIFCONF_: {
+            // Guest (musl/arm64) struct ifconf layout: int ifc_len @0, then a
+            // union{void*; ifreq*} ifc_buf/ifc_req @8 (16-byte total). `arg` is
+            // the host-mapped copy; fd_ioctl copies it back to the guest.
+            uint32_t glen; addr_t gbuf;
+            memcpy(&glen, arg, sizeof(uint32_t));
+            memcpy(&gbuf, (char *) arg + 8, sizeof(addr_t));
+            struct ifaddrs *ifas = NULL;
+            if (getifaddrs(&ifas) != 0)
+                return _EFAULT;
+            int count = 0;
+            for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
+                if (ifa->ifa_addr == NULL) continue;
+                int family = ifa->ifa_addr->sa_family;
+                if (family != AF_INET && family != AF_INET6) continue;
+                count++;
+            }
+            int room = (int) glen;
+            if (room <= 0) {
+                int need = count * (int)sizeof(struct ifreq);
+                ((uint32_t *) arg)[0] = (uint32_t) need; // ifc_len @ offset 0
+                freeifaddrs(ifas);
+                return 0;
+            }
+            int used = 0;
+            char *out = malloc(glen);
+            if (out) memset(out, 0, glen);
+            for (struct ifaddrs *ifa = ifas; ifa && out && room >= (int)sizeof(struct ifreq); ifa = ifa->ifa_next) {
+                if (ifa->ifa_addr == NULL) continue;
+                int family = ifa->ifa_addr->sa_family;
+                if (family != AF_INET && family != AF_INET6) continue;
+                struct ifreq q; memset(&q, 0, sizeof(q));
+                strncpy(q.ifr_name, ifa->ifa_name, IFNAMSIZ - 1);
+                // ifr_addr is a 16-byte struct sockaddr (IPv6 needs 28, so only
+                // the first 16 bytes fit — ifconfig is IPv4-oriented anyway).
+                socklen_t alen = (family == AF_INET)
+                    ? sizeof(struct sockaddr_in)
+                    : sizeof(struct sockaddr);
+                memcpy(&q.ifr_addr, ifa->ifa_addr, alen);
+                memcpy(out + used, &q, sizeof(struct ifreq));
+                used += sizeof(struct ifreq);
+                room -= sizeof(struct ifreq);
+            }
+            if (out) {
+                if (used > 0 && user_write(gbuf, out, used) != 0) { free(out); freeifaddrs(ifas); return _EFAULT; }
+                free(out);
+            }
+            // write back the consumed length into the host ifconf buffer (ifc_len @ offset 0)
+            ((uint32_t *) arg)[0] = (uint32_t) used;
+            freeifaddrs(ifas);
+            return 0;
+        }
         case TCSETS_:
         case TCSETSW_:
         case TCSETSF_:
@@ -731,6 +815,23 @@ int realfs_ioctl(struct fd *fd, int cmd, void *arg) {
                 return 0;
             }
             return 0;
+    }
+    // SIOC{G}IF* interface ioctls on a socket fd: forward to the host real fd.
+    // Guest and host are both aarch64 so `struct ifreq` is layout-identical and
+    // fd_ioctl() has already copied the buffer in/out for us.
+    // SIOC{G}IF* interface ioctls: aarch64 guest and host share an identical
+    // `struct ifreq` layout, so single-ifreq requests forward as-is. SIOCGIFCONF
+    // (0x8912) is handled specially above; the rest (0x8900..0x89ff) are
+    // informational queries whose host ioctl often fails (ENOTTY) on non-real
+    // or netlink sockets — tools tolerate that, so report success.
+    if (cmd >= 0x8900 && cmd <= 0x89ff) {
+        err = ioctl(fd->real_fd, cmd, arg);
+        if (err < 0) {
+            if (errno == ENOTTY || errno == EBADF)
+                return 0;
+            return errno_map();
+        }
+        return 0;
     }
     return _ENOTTY;
 }

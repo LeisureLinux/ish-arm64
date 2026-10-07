@@ -41,6 +41,41 @@ struct sockaddr_max_ {
     char data[SOCKADDR_DATA_MAX];
 };
 
+// Guest (Linux/arm64) SIOC{G,S}IF* ioctls. The aarch64 guest and aarch64 host
+// share an identical `struct ifreq` layout, so these can be forwarded directly
+// to the host ioctl on the underlying real socket fd (see fs/real.c).
+#define SIOCGIFNAME_   0x8910
+#define SIOCGIFCONF_   0x8912
+#define SIOCGIFFLAGS_  0x8913
+#define SIOCGIFADDR_   0x8915
+#define SIOCGIFNETMASK_ 0x891b
+#define SIOCGIFMETRIC_ 0x891d
+#define SIOCGIFMTU_    0x8921
+#define SIOCGIFHWADDR_ 0x8927
+#define SIOCGIFINDEX_  0x8933
+#define SIOCGIFBRDADDR_ 0x8919
+#define SIOCGIFDSTADDR_ 0x8917
+
+struct ifreq_ {
+    char name[16];
+    union {
+        struct sockaddr_ addr;
+        struct sockaddr_ dstaddr;
+        struct sockaddr_ broadaddr;
+        struct sockaddr_ netmask;
+        struct sockaddr_ hwaddr;
+        int flags;
+        int ivalue;
+        int ifindex;
+        int metric;
+        int mtu;
+        // struct ifmap (musl): 2*ulong + short + 3*char, padded to 24 on
+        // aarch64, making the ifru union 24 bytes and struct ifreq 40 total.
+        struct { uint64_t mem[2]; uint16_t base_addr; uint8_t irq, dma, port; } map;
+    } u;
+};
+static_assert(sizeof(struct ifreq_) == 40, "struct ifreq_ must match aarch64 musl struct ifreq (40 bytes)");
+
 size_t sockaddr_size(void *p);
 // result comes from malloc
 struct sockaddr *sockaddr_to_real(void *p);

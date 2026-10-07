@@ -65,6 +65,12 @@ struct fd {
             // [STAGE-0 PROBE] AF_NETLINK stub: the write end of the backing
             // socketpair. -1 for every non-netlink socket. See fs/sock.c.
             int netlink_peer_fd;
+            // Synthesized netlink replies are buffered here (not via the
+            // socketpair) so a subsequent recvfrom/recvmsg drains them
+            // deterministically without socketpair timing races.
+            char *netlink_reply;
+            size_t netlink_reply_len;
+            size_t netlink_reply_off;
             cond_t unix_got_peer;
             // Queue of struct scm for sending file descriptors
             // locked by fd->lock
