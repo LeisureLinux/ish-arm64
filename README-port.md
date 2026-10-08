@@ -53,6 +53,33 @@ $ ss               # 干净返回空表（不再崩溃）
 > `RTM_GETROUTE` 的合成 dump 不解析，属 guest 侧噪音，非 iSH 错误；可选实现
 > `RTM_GETROUTE` 合成来消除）。
 
+## CPU 拓扑可见性：`lscpu` / `fastfetch` 能读到真实 CPU
+
+**问题**：guest 根文件系统是 `fakefs`，只挂了 `proc` / `devpts`，**没有 `/sys`**。
+因此 `lscpu` 报 `failed to determine number of CPUs:
+/sys/devices/system/cpu/possible: No such file or directory`，`fastfetch` 只能显示
+`CPU: Unknown*4 (4)`。
+
+**改动**：
+- `main.c`：Linux 宿主下把宿主的真实 `/sys` 以 `realfs` 挂进 guest（macOS 宿主保持
+  原样）。宿主本身有完整的 `/sys/devices/system/cpu/possible`，所以 `lscpu` 直接
+  拿到真实拓扑与型号。
+- `fs/proc/root.c`：在合成的 ARM64 `/proc/cpuinfo` 里增加 `Hardware:` 行，内容从
+  宿主 `/proc/device-tree/model` 读取（回退到 uname arch），让 `fastfetch` 显示真实
+  板型名。
+
+**实测（Orange Pi，aarch64）**：
+```
+$ lscpu | grep -E 'Architecture|CPU\(s\)|On-line'
+Architecture:        aarch64
+CPU(s):              4
+On-line CPU(s) list: 0-3
+$ cat /sys/devices/system/cpu/possible
+0-3
+$ fastfetch | grep CPU
+CPU: OrangePi Zero3 (4) @ 1.42 GHz
+```
+
 ## 文件清单
 | 文件 | 作用 |
 |------|------|
